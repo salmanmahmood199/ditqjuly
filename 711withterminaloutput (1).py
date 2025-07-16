@@ -396,8 +396,9 @@ def build_txn_payload(tx: dict) -> dict:
     paid_d   = Decimal(paid).quantize(Decimal('0.01'), ROUND_HALF_UP)
     change   = (paid_d - tot_due).quantize(Decimal('0.01'), ROUND_HALF_UP)
     
-    # Build items
+    # Build items and discounts
     items_list = []
+    discount_list = []
     idx = 1
     for itm in tx['items'] + tx['voids']:
         is_void = itm['event'] == 'void'
@@ -405,21 +406,24 @@ def build_txn_payload(tx: dict) -> dict:
         typ     = 'Voided' if is_void else 'Sale'
         pid     = f"PID{tx['seq']}_{idx}"
         idx += 1
-        
-        # Better handling for promotions
+
+        # Determine if item is a promotion/discount
         is_promo = 'PROMO' in itm['name'].upper() or itm['price'] < 0
+
+        if is_promo and not is_void:
+            # Treat promotions as discounts rather than negative items
+            disc_val = float(Decimal(abs(itm['price'])).quantize(Decimal('0.01'), ROUND_HALF_UP))
+            discount_list.append({
+                'Value': disc_val,
+                'Description': itm['name'],
+                'Category': 'Promotion'
+            })
+            continue  # Do not add promo item to items_list
+
         category = 'Promotion' if is_promo else 'General'
-        
-        # For promotions with positive prices, convert to negative
         item_price = itm['price']
-        if is_promo and item_price > 0 and not is_void:
-            # Make it negative for proper promotion handling
-            item_price = -abs(item_price)
-            print(f"[INFO] Converting positive promotion price to negative: {itm['name']} from ${itm['price']} to ${item_price}")
-        else:
-            item_price = itm['price']
-        
-        # Create the item with proper categorization
+
+        # Create the item
         items_list.append({
             'OrderItemState': [{ 'ItemState': {'value': state}, 'Timestamp': tx['ts_utc'] }],
             'MenuProduct': {
@@ -430,10 +434,10 @@ def build_txn_payload(tx: dict) -> dict:
                     'Category': category,
                     'iD': f"{pid}_MI",
                     'Description': itm['name'],
-                    'Pricing': [{ 
-                        'Tax': [], 
+                    'Pricing': [{
+                        'Tax': [],
                         'ItemPrice': float(Decimal(item_price).quantize(Decimal('0.01'), ROUND_HALF_UP)),
-                        'Quantity': itm['quantity'] 
+                        'Quantity': itm['quantity']
                     }],
                     'SKU': { 'productName': itm['name'], 'productCode': pid }
                 }],
@@ -456,6 +460,20 @@ def build_txn_payload(tx: dict) -> dict:
         pi += 1
     # Tax array
     tax_arr = [{ 'amount': float(tax_d), 'Description': 'Sales Tax' }] if tax_d > 0 else []
+
+    # Build total dictionary including explicit discounts
+    total_dict = {
+        'ItemPrice': float(net_item),
+        'Tax': tax_arr
+    }
+    if discount_list:
+        total_dict['Discount'] = discount_list
+    elif discount != 0.0:
+        total_dict['Discount'] = [{
+            'Value': float(Decimal(abs(discount)).quantize(Decimal('0.01'), ROUND_HALF_UP)),
+            'Description': 'Discount',
+            'Category': 'Promotion'
+        }]
     # Determine transaction state based on voids and item types
     has_voided_items = bool(tx['voids'])
     all_items_voided = has_voided_items and all(item['event'] == 'void' for item in tx['items'] + tx['voids'])
@@ -491,7 +509,7 @@ def build_txn_payload(tx: dict) -> dict:
                 'OrderTime': current_ts,  # Use current time
                 'OrderState': order_state,
                 'OrderItem': items_list,
-                'Total': { 'ItemPrice': float(net_item), 'Tax': tax_arr },
+                'Total': total_dict,
                 'OrderItemCount': len(items_list),
                 'Payment': payments
             }
